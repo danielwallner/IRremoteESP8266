@@ -26,7 +26,7 @@
 ///  i.e. If not, assume a 100% duty cycle. Ignore attempts to change the
 ///  duty cycle etc.
 IRsend::IRsend(uint16_t IRsendPin, bool inverted, bool use_modulation)
-    : IRpin(IRsendPin), periodOffset(kPeriodOffset) {
+    : IRpin(IRsendPin) {
   if (inverted) {
     outputOn = LOW;
     outputOff = HIGH;
@@ -68,15 +68,12 @@ void IRsend::ledOn() {
 /// @param[in] use_offset Should we use the calculated offset or not?
 /// @return nr. of uSeconds.
 /// @note (T = 1/f)
-uint32_t IRsend::calcUSecPeriod(uint32_t hz, bool use_offset) {
+uint32_t IRsend::calcUSecPeriod(uint32_t hz) {
   if (hz == 0) hz = 1;  // Avoid Zero hz. Divide by Zero is nasty.
   uint32_t period =
       (1000000UL + hz / 2) / hz;  // The equiv of round(1000000/hz).
   // Apply the offset and ensure we don't result in a <= 0 value.
-  if (use_offset)
-    return std::max((uint32_t)1, period + periodOffset);
-  else
-    return std::max((uint32_t)1, period);
+  return std::max((uint32_t)1, period);
 }
 
 /// Set the output frequency modulation and duty cycle.
@@ -166,23 +163,102 @@ uint16_t IRsend::mark(uint16_t usec) {
   // Not simple, so do it assuming frequency modulation.
   uint16_t counter = 0;
   IRtimer usecTimer = IRtimer();
-  // Cache the time taken so far. This saves us calling time, and we can be
-  // assured that we can't have odd math problems. i.e. unsigned under/overflow.
-  uint32_t elapsed = usecTimer.elapsed();
+  // Use absolute time for zero drift (but slightly uneven period).
+  uint32_t nextStop = 0; // must be 32 bit to not overflow when usec is near max.
+#if SEND_BANG_OLUFSEN
+  // The two following loops are only an improvement for modulation frequencies above 100 kHz or so.
 
-  while (elapsed < usec) {  // Loop until we've met/exceeded our required time.
+  // Free running loop to attempt to get close to 455 kHz required by Bang & Olufsen
+  // Maxed out at 293 kHz on ESP8266
+  uint32_t nextCheck = 16; // Assume we can at least run for this number of periods.
+  if (onTimePeriod == 1 && offTimePeriod == 1) {
+    for (;;) {  // nextStop is not updated in this loop.
+      ledOn();
+      ledOff();
+      counter++;
+      if (counter == 10) {
+        // Ideally 20 us have elapsed now.
+        uint16_t now = usecTimer.elapsed();
+        if (now < 17) {
+          // We are faster than we should be.
+          // Fall through and assume we can handle it below.
+          nextStop = now;
+          break;
+        }
+      }
+      if (counter >= nextCheck) {
+        uint16_t now = usecTimer.elapsed();
+        int32_t timeLeft = usec - now;
+        if (timeLeft <= 1) {
+          return counter;
+        }
+        uint32_t periodsToEnd = counter * timeLeft / now;
+        // Check again when we are half way closer to the end.
+        nextCheck = (periodsToEnd >> 2) + counter;
+      }
+    }
+  }
+
+  // Using IRtimer.elapsed() instead of _delayMicroseconds works better for short period times.
+  // Maxed out at 219 kHz on ESP8266
+  const uint16_t kMinAccurateUsecDelay = 6;
+  if (onTimePeriod < kMinAccurateUsecDelay || offTimePeriod < kMinAccurateUsecDelay) {
+    bool freeRun = false; // Skip checking micros() if we are behind.
+    while (nextStop < usec) {  // Loop until we've met/exceeded our required time.
+      ledOn();
+      nextStop = std::min(nextStop + onTimePeriod, uint32_t(usec));
+      if (!freeRun)
+        while(usecTimer.elapsed() < nextStop);
+      ledOff();
+      counter++;
+      nextStop = std::min(nextStop + offTimePeriod, uint32_t(usec));
+      uint16_t now = usecTimer.elapsed();
+      int16_t delay = nextStop - now;
+      if (delay > 0) {
+        if (!freeRun)
+          while(usecTimer.elapsed() < nextStop);
+        freeRun = false;
+      } else if (nextStop < usec) {
+        // This means we ran past nextStop and need to reset to actual time.
+        nextStop = now + offTimePeriod;
+        freeRun = true;
+      }
+    }
+    return counter;
+  }
+#endif
+
+  // This will output the correct number of pulses +-1 at the price of adding a bit of jitter.
+  // For better precision onTimePeriod/offTimePeriod would need to be fixed point numbers.
+  // The first few pulses will have a slightly longer period until compensation reaches it's correct value.
+  // Maxed out at 138 kHz on ESP8266
+  int16_t compensation = 0; // Compensate for extra delays.
+  while (nextStop < usec) {  // Loop until we've met/exceeded our required time.
     ledOn();
-    // Calculate how long we should pulse on for.
-    // e.g. Are we to close to the end of our requested mark time (usec)?
-    _delayMicroseconds(std::min((uint32_t)onTimePeriod, usec - elapsed));
+    nextStop = std::min(nextStop + onTimePeriod, uint32_t(usec));
+    uint16_t now = usecTimer.elapsed();
+    int16_t delay = nextStop - now;
+    delay += compensation;
+    if (delay >= 0)
+      _delayMicroseconds(delay);
     ledOff();
     counter++;
-    if (elapsed + onTimePeriod >= usec)
-      return counter;  // LED is now off & we've passed our allotted time.
-    // Wait for the lesser of the rest of the duty cycle, or the time remaining.
-    _delayMicroseconds(
-        std::min(usec - elapsed - onTimePeriod, (uint32_t)offTimePeriod));
-    elapsed = usecTimer.elapsed();  // Update & recache the actual elapsed time.
+    nextStop = std::min(nextStop + offTimePeriod, uint32_t(usec));
+    now = usecTimer.elapsed();
+    delay = nextStop - now;
+    if (delay < offTimePeriod)
+      --compensation;
+    else if (delay > offTimePeriod)
+      ++compensation;
+    delay += compensation;
+    if (delay > 0)
+      _delayMicroseconds(delay);
+    else if (nextStop < usec) {
+      _delayMicroseconds(1); // Wait at least a little.
+      // This means we ran past nextStop and need to reset to actual time.
+      nextStop = now + offTimePeriod;
+      compensation = 0;
+    }
   }
   return counter;
 }
@@ -207,7 +283,7 @@ void IRsend::space(uint32_t time) {
 int8_t IRsend::calibrate(uint16_t hz) {
   if (hz < 1000)  // Were we given kHz? Supports the old call usage.
     hz *= 1000;
-  periodOffset = 0;  // Turn off any existing offset while we calibrate.
+  int8_t periodOffset = 0;
   enableIROut(hz);
   IRtimer usecTimer = IRtimer();  // Start a timer *just* before we do the call.
   uint16_t pulses = mark(UINT16_MAX);  // Generate a PWM of 65,535 us. (Max.)
