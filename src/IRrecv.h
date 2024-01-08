@@ -44,7 +44,11 @@ const uint16_t kRawTick = 2;     // Capture tick to uSec factor.
 // before we need to start capturing a possible new message.
 // Typically 15ms suits most applications. However, some protocols demand a
 // higher value. e.g. 90ms for XMP-1 and some aircon units.
+#ifdef DECODE_BANG_OLUFSEN
+const uint8_t kTimeoutMs = 12;  // In MilliSeconds.
+#else
 const uint8_t kTimeoutMs = 15;  // In MilliSeconds.
+#endif
 #define TIMEOUT_MS kTimeoutMs   // For legacy documentation.
 const uint16_t kMaxTimeoutMs = kRawTick * (UINT16_MAX / MS_TO_USEC(1));
 
@@ -883,6 +887,12 @@ class IRrecv {
                   const uint16_t kYorkBits,
                   const bool strict = true);
 #endif  // DECODE_YORK
+#if DECODE_BANG_OLUFSEN
+  bool decodeBangOlufsen(decode_results *results,
+                  uint16_t offset = kStartOffset,
+                  const uint16_t nbits = kBangOlufsenBits,
+                  const bool strict = true);
+#endif  // DECODE_BANG_OLUFSEN
 };
 
 #endif  // IRRECV_H_
